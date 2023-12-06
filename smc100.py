@@ -94,6 +94,13 @@ class SMC100Connection:
             xonxoff = True,
             timeout = 0.050)
 
+    def close(self):
+        if self._port:
+            self._port.close()
+            self._port = None
+    def __del__(self):
+        self.close()
+
 class SMC100Stage(SMC100Connection):
     """
     Class for individual SMC100 stages, inheriting instance of SMC100 connection.
@@ -113,8 +120,8 @@ class SMC100Stage(SMC100Connection):
         assert smcID is not None
         self._last_sendcmd_time = 0
         self.obj = parent
-        self._smcID = smcID
-        print('> Added stage {} to the connection on COM{}'.format(smcID, self.COMport))
+        self._smcID = str(smcID)
+        print('> Added stage {} to the connection on port {}'.format(smcID, self.COMport))
         if stage_defaults is not None:
             print('> Setting defaults for stage type {}'.format(stage_defaults))
             for k, v in STAGES_DEFAULT_PARAMS[stage_defaults].items():
@@ -281,7 +288,6 @@ class SMC100Stage(SMC100Connection):
             waittime = time.time() - starttime
             if waittime > MAX_WAIT_TIME_SEC:
                 raise SMC100WaitTimedOutException()
-
             try:
                 state = self.get_status()[1]
                 if state in targetstates:
@@ -313,10 +319,6 @@ class SMC100Stage(SMC100Connection):
 
         self.wait_states(STATE_NOT_REFERENCED_FROM_RESET, ignore_disabled_states=True)
 
-        # Homing
-        self.sendcmd(command='OR')
-        self._sleepfunc(3)
-        self.wait_states((STATE_READY_FROM_HOMING,))
         try:
             stage = self.sendcmd(command='ID', argument='?', expect_response=True)
             print('Found stage', stage)
@@ -335,6 +337,8 @@ class SMC100Stage(SMC100Connection):
 
         # wait for us to get back into NOT REFERENCED state
         self.wait_states(STATE_NOT_REFERENCED_FROM_CONFIGURATION)
+        self.home(waitStop=True)
+
     def get_status(self, silent=False):
         """
         Executes TS? and returns the the error code as integer and state as string
@@ -434,11 +438,3 @@ class SMC100Stage(SMC100Connection):
 
     def stop(self):
         self.sendcmd(command='ST')
-
-    def close(self):
-        if self._port:
-            self._port.close()
-            self._port = None
-
-    def __del__(self):
-        self.close()
