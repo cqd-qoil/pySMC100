@@ -2,8 +2,6 @@
 import serial
 import time
 
-from math import floor
-
 controller_state_map = {
     '0A': 'NOT REFERENCED from reset',
     '0B': 'NOT REFERENCED from HOMING',
@@ -28,14 +26,12 @@ controller_state_map = {
     '47': 'JOGGING from DISABLE',
     '48': 'SIMULATION MODE'}
 
-unit_table = {'PR50CC':'deg'}
-
-stage_defaults = {'MFA-CC': {'unit':            'mm',
-                             'travel_range':    25,
-                             'max_speed':       2.5},
-                  'PR50CC': {'unit':            'deg',
-                             'travel_range':    360,
-                             'max_speed':       20}}
+STAGES_DEFAULT_PARAMS = {'MFA-CC': {'unit':            'mm',
+                                    'travel_range':    25,
+                                    'max_speed':       2.5},
+                         'PR50CC': {'unit':            'deg',
+                                    'travel_range':    360,
+                                    'max_speed':       20}}
 
 
 # never wait for more than this e.g. during wait_states
@@ -80,71 +76,15 @@ class SMC100InvalidResponseException(Exception):
         s = 'Invalid response to {}: {}'.format(cmd, resp)
         super(SMC100InvalidResponseException, self).__init__(s)
 
-class SMC100(object):
-    """
-    Class to interface with Newport's SMC100 controller.
-
-    The SMC100 accepts commands in the form of:
-
-    <ID><command><arguments><CR><LF>
-
-    Reply, if any, will be in the form
-
-    <ID><command><result><CR><LF>
-
-    There is minimal support for manually setting stage parameter as Newport's
-    ESP stages can supply the SMC100 with the correct configuration parameters.
-
-    Some effort is made to take up backlash, but this should not be trusted too
-    much.
-
-    The move commands must be used with care, because they make assumptions
-    about the units which is dependent on the STAGE. I only have TRB25CC, which
-    has native units of mm. A more general implementation will move the move
-    methods into a stage class.
-    """
-
-    _port = None
-    _smcID = None
-
-    _silent = True
-
+class SMC100Connection:
     _sleepfunc = time.sleep
-
-    def __init__(self, smcID, port, backlash_compensation=True, silent=True, sleepfunc=None):
-        """
-        If backlash_compensation is False, no backlash compensation will be done.
-
-        If silent is False, then additional output will be emitted to aid in
-        debugging.
-        p
-        If sleepfunc is not None, then it will be used instead of time.sleep. It
-        will be given the number of seconds (float) to sleep for, and is provided
-        for ease integration with single threaded GUIs.
-
-        Note that this method only connects to the controller, it otherwise makes
-        no attempt to home or configure the controller for the attached stage. This
-        delibrate to minimise realworld side effects.
-
-        If the controller has previously been configured, it will suffice to simply
-        call home() to take the controller out of not referenced mode. For a brand
-        new controller, call reset_and_configure().
-        """
-
-        super(SMC100, self).__init__()
-
-        assert smcID is not None
+    def __init__(self, port, silent=True):
+        super(SMC100Connection, self).__init__()
         assert port is not None
 
-        if sleepfunc is not None:
-            self._sleepfunc = sleepfunc
-
         self._silent = silent
-
-        self._last_sendcmd_time = 0
-
         print('Connecting to SMC100 on {}'.format(port))
-
+        self.COMport = port
         self._port = serial.Serial(
             port = port,
             baudrate = 57600,
@@ -153,8 +93,215 @@ class SMC100(object):
             parity = 'N',
             xonxoff = True,
             timeout = 0.050)
-        self._smcID = str(smcID)
 
+class SMC100Stage(SMC100Connection):
+    """
+    Class for individual SMC100 stages, inheriting instance of SMC100 connection.
+
+    Accepts commands in the form of:
+
+    <ID><command><arguments><CR><LF>
+
+    Reply, if any, will follow
+
+    <ID><command><result><CR><LF>
+
+    There is minimal support for manually setting stage parameter as Newport's
+    ESP stages can supply the SMC100 with the correct configuration parameters.
+    """
+    def __init__(self, parent, smcID, stage_defaults=None):
+        assert smcID is not None
+        self._last_sendcmd_time = 0
+        self.obj = parent
+        self._smcID = smcID
+        print('> Added stage {} to the connection on COM{}'.format(smcID, self.COMport))
+        if stage_defaults is not None:
+            print('> Setting defaults for stage type {}'.format(stage_defaults))
+            for k, v in STAGES_DEFAULT_PARAMS[stage_defaults].items():
+                setattr(self, k, v)
+
+    def set_defaults(self, name=None):
+        if name is None:
+            self.name = self.sendcmd(command='ZX',argument='?',expect_response=True)
+        else:
+            self.name = name
+        try:
+            for k, v in STAGES_DEFAULT_PARAMS[self.name].items():
+                setattr(self, k, v)
+        except Exception as ex:
+            raise ex
+
+    def __getattr__(self,attr):
+        return getattr(self.obj, attr)
+
+    def sendcmd(self, command, argument=None, expect_response=False, retry=False):
+        """
+        Send the specified command along with the argument, if any. The response
+        is checked to ensure it has the correct prefix, and is returned WITHOUT
+        the prefix.
+
+        It is important that for GET commands, e.g. 1ID?, the ? is specified as an
+        ARGUMENT, not as part of the command. Doing so will result in assertion
+        failure.
+
+        If expect_response is True, a response is expected from the controller
+        which will be verified and returned without the prefix.
+
+        If expect_response is True, and retry is True or an integer, then when the
+        response does not pass verification, the command will be sent again for
+        retry number of times, or until success if retry is True.
+
+        The retry option MUST BE USED CAREFULLY. It should ONLY be used read-only
+        commands, because otherwise REPEATED MOTION MIGHT RESULT. In fact some
+        commands are EXPLICITLY REJECTED to prevent this, such as relative move.
+        """
+        assert command[-1] != '?'
+
+        if self._port is None:
+            return
+
+        if argument is None:
+            argument = ''
+
+        prefix = self._smcID + command
+        tosend = prefix + str(argument)
+        print(tosend)
+        # prevent certain commands from being retried automatically
+        no_retry_commands = ['PR', 'OR']
+        if command in no_retry_commands:
+            retry = False
+
+        while self._port is not None:
+            if expect_response:
+                self._port.flushInput()
+
+            self._port.flushOutput()
+            self._port.write(tosend.encode())
+            self._port.write(b'\r\n')
+            self._port.flush()
+
+            if not self._silent:
+                self._emit('sent', tosend)
+
+            if expect_response:
+                try:
+                    response = self._readline()
+                    if response.startswith(prefix):
+                        return response[len(prefix):]
+                    else:
+                        raise SMC100InvalidResponseException(command, response)
+                except Exception as ex:
+                    if not retry or retry <=0:
+                        raise ex
+                    else:
+                        if type(retry) == int:
+                            retry -= 1
+                        continue
+            else:
+                # we only need to delay when we are not waiting for a response
+                now = time.time()
+                dt = now - self._last_sendcmd_time
+                dt = COMMAND_WAIT_TIME_SEC - dt
+                if dt > 0:
+                    self._sleepfunc(dt)
+
+                self._last_sendcmd_time = now
+                return None
+
+    def _readline(self):
+        """
+        Returns a line, that is reads until line termination \r\n. Required due to
+        different behaviour of serial
+
+        With python < 2.6, pySerial uses serial.FileLike, that provides a readline
+        that accepts the max number of chars to read, and the end of line
+        character.
+
+        With python >= 2.6, pySerial uses io.RawIOBase, whose readline only
+        accepts the max number of chars to read. io.RawIOBase does support the
+        idea of a end of line character, but it is an attribute on the instance,
+        which makes sense... except pySerial doesn't pass the newline= keyword
+        argument along to the underlying class, and so you can't actually change
+        it.
+        """
+        done = False
+        line = str()
+        #print 'reading line',
+        while not done:
+            c = self._port.read().decode()
+              # ignore \r since it is part of the line terminator
+            if len(c) == 0:
+                raise SMC100ReadTimeOutException()
+            elif c == '\r':
+                continue
+            elif c == '\n':
+                done = True
+            elif ord(c) > 32 and ord(c) < 127:
+                line += c
+            else:
+                raise SMC100RS232CorruptionException(c)
+
+        self._emit('read', line)
+        return line
+
+    def _emit(self, *args):
+        if len(args) == 1:
+            prefix = ''
+            message = args[0]
+        else:
+            prefix = ' ' + args[0]
+            message = args[1]
+
+        if not self._silent:
+            print('[SMC100' + prefix + '] ' + message)
+
+    def wait_states(self, targetstates, ignore_disabled_states=False):
+        """
+        Waits for the controller to enter one of the the specified target state.
+        Controller state is determined via the TS command.
+
+        If ignore_disabled_states is True, disable states are ignored. The normal
+        behaviour when encountering a disabled state when not looking for one is
+        for an exception to be raised.
+
+        Note that this method will ignore read timeouts and keep trying until the
+        controller responds.  Because of this it can be used to determine when the
+        controller is ready again after a command like PW0 which can take up to 10
+        seconds to execute.
+
+        If any disable state is encountered, the method will raise an error,
+        UNLESS you were waiting for that state. This is because if we wait for
+        READY_FROM_MOVING, and the stage gets stuck we transition into
+        DISABLE_FROM_MOVING and then STAY THERE FOREVER.
+        """
+        starttime = time.time()
+        done = False
+        self._emit('Waiting for states {}'.format(str(targetstates)))
+        while not done:
+            waittime = time.time() - starttime
+            if waittime > MAX_WAIT_TIME_SEC:
+                raise SMC100WaitTimedOutException()
+
+            try:
+                state = self.get_status()[1]
+                if state in targetstates:
+                    self._emit('in state {}'.format(state))
+                    return state
+                elif not ignore_disabled_states:
+                    disabledstates = [
+                      STATE_DISABLE_FROM_READY,
+                      STATE_DISABLE_FROM_JOGGING,
+                      STATE_DISABLE_FROM_MOVING]
+                    if state in disabledstates:
+                        raise SMC100DisabledStateException(state)
+                elif state in ['0B','0C','0D','0E','0F']: # Not referenced
+                    self._emit('not referenced')
+                    return state
+
+            except SMC100ReadTimeOutException:
+                self._emit('Read timed out, retrying in 1 second')
+                self._sleepfunc(1)
+                continue
     def reset_and_configure(self):
         """
         Configures the controller by resetting it and then asking it to load
@@ -166,14 +313,15 @@ class SMC100(object):
 
         self.wait_states(STATE_NOT_REFERENCED_FROM_RESET, ignore_disabled_states=True)
 
+        # Homing
         self.sendcmd(command='OR')
         self._sleepfunc(3)
+        self.wait_states((STATE_READY_FROM_HOMING,))
         try:
             stage = self.sendcmd(command='ID', argument='?', expect_response=True)
             print('Found stage', stage)
         except:
-            print()
-            self.move_absolute(0,waitStop=False)
+            self.move_absolute(0, waitStop=False)
 
         # enter config mode
         self.sendcmd(command='PW', argument=1)
@@ -187,15 +335,6 @@ class SMC100(object):
 
         # wait for us to get back into NOT REFERENCED state
         self.wait_states(STATE_NOT_REFERENCED_FROM_CONFIGURATION)
-
-    def calibrate(self):
-        self.name = self.sendcmd(command='ZX',argument='?',expect_response=True)
-        try:
-            self.max_speed = stage_defaults[self.name]['max_speed']
-            self.travel_range = stage_defaults[self.name]['travel_range']
-        except Exception as ex:
-            raise ex
-
     def get_status(self, silent=False):
         """
         Executes TS? and returns the the error code as integer and state as string
@@ -237,14 +376,14 @@ class SMC100(object):
           # wait for the controller to be ready
             st = self.wait_states((STATE_READY_FROM_HOMING,
                                     STATE_READY_FROM_MOVING))
-        if st == STATE_READY_FROM_MOVING:
-            self.move_absolute(0, waitStop=True)
-            st = self.wait_states()
-        else:
-            self.move_absolute(0, waitStop=False)
-
-    def stop(self):
-        self.sendcmd(command='ST')
+            if st == STATE_READY_FROM_MOVING:
+                self.move_absolute(0, waitStop=True)
+            else:
+                self.move_absolute(0, waitStop=False)
+                st = self.wait_states((STATE_READY_FROM_MOVING,
+                                        STATE_NOT_REFERENCED_FROM_MOVING))
+                if st == STATE_NOT_REFERENCED_FROM_MOVING:
+                    self.home(waitStop=True)
 
     def move_relative(self, distance, waitStop=True):
         """
@@ -293,182 +432,8 @@ class SMC100(object):
             if st == STATE_NOT_REFERENCED_FROM_MOVING and retry:
                 self.home()
 
-    def wait_states(self, targetstates, ignore_disabled_states=False):
-        """
-        Waits for the controller to enter one of the the specified target state.
-        Controller state is determined via the TS command.
-
-        If ignore_disabled_states is True, disable states are ignored. The normal
-        behaviour when encountering a disabled state when not looking for one is
-        for an exception to be raised.
-
-        Note that this method will ignore read timeouts and keep trying until the
-        controller responds.  Because of this it can be used to determine when the
-        controller is ready again after a command like PW0 which can take up to 10
-        seconds to execute.
-
-        If any disable state is encountered, the method will raise an error,
-        UNLESS you were waiting for that state. This is because if we wait for
-        READY_FROM_MOVING, and the stage gets stuck we transition into
-        DISABLE_FROM_MOVING and then STAY THERE FOREVER.
-
-        The state encountered is returned.
-        """
-        starttime = time.time()
-        done = False
-        self._emit('waiting for states {}'.format(str(targetstates)))
-        while not done:
-            waittime = time.time() - starttime
-            if waittime > MAX_WAIT_TIME_SEC:
-                raise SMC100WaitTimedOutException()
-
-            try:
-                state = self.get_status()[1]
-                if state in targetstates:
-                    self._emit('in state {}'.format(state))
-                    return state
-                elif not ignore_disabled_states:
-                    disabledstates = [
-                      STATE_DISABLE_FROM_READY,
-                      STATE_DISABLE_FROM_JOGGING,
-                      STATE_DISABLE_FROM_MOVING]
-                    if state in disabledstates:
-                        raise SMC100DisabledStateException(state)
-                elif state in ['0B','0C','0D','0E','0F']: # Not referenced
-                    self._emit('not referenced')
-                    return state
-
-            except SMC100ReadTimeOutException:
-                self._emit('Read timed out, retrying in 1 second')
-                self._sleepfunc(1)
-                continue
-
-    def sendcmd(self, command, argument=None, expect_response=False, retry=False):
-        """
-        Send the specified command along with the argument, if any. The response
-        is checked to ensure it has the correct prefix, and is returned WITHOUT
-        the prefix.
-
-        It is important that for GET commands, e.g. 1ID?, the ? is specified as an
-        ARGUMENT, not as part of the command. Doing so will result in assertion
-        failure.
-
-        If expect_response is True, a response is expected from the controller
-        which will be verified and returned without the prefix.
-
-        If expect_response is True, and retry is True or an integer, then when the
-        response does not pass verification, the command will be sent again for
-        retry number of times, or until success if retry is True.
-
-        The retry option MUST BE USED CAREFULLY. It should ONLY be used read-only
-        commands, because otherwise REPEATED MOTION MIGHT RESULT. In fact some
-        commands are EXPLICITLY REJECTED to prevent this, such as relative move.
-        """
-        assert command[-1] != '?'
-
-        if self._port is None:
-            return
-
-        if argument is None:
-            argument = ''
-
-        prefix = self._smcID + command
-        tosend = prefix + str(argument)
-        print(tosend)
-        # prevent certain commands from being retried automatically
-        no_retry_commands = ['PR', 'OR']
-        if command in no_retry_commands:
-            retry = False
-
-        while self._port is not None:
-            if expect_response:
-                self._port.flushInput()
-
-            self._port.flushOutput()
-
-            self._port.write(tosend.encode())
-            self._port.write(b'\r\n')
-
-            self._port.flush()
-
-            if not self._silent:
-                self._emit('sent', tosend)
-
-            if expect_response:
-                try:
-                    response = self._readline()
-                    if response.startswith(prefix):
-                        return response[len(prefix):]
-                    else:
-                        raise SMC100InvalidResponseException(command, response)
-                except Exception as ex:
-                    if not retry or retry <=0:
-                        raise ex
-                    else:
-                        if type(retry) == int:
-                            retry -= 1
-                        continue
-            else:
-                # we only need to delay when we are not waiting for a response
-                now = time.time()
-                dt = now - self._last_sendcmd_time
-                dt = COMMAND_WAIT_TIME_SEC - dt
-                if dt > 0:
-                    self._sleepfunc(dt)
-
-                self._last_sendcmd_time = now
-                return None
-
-    def _readline(self):
-        """
-        Returns a line, that is reads until \r\n.
-
-        OK, so you are probably wondering why I wrote this. Why not just use
-        self._port.readline()?
-
-        I am glad you asked.
-
-        With python < 2.6, pySerial uses serial.FileLike, that provides a readline
-        that accepts the max number of chars to read, and the end of line
-        character.
-
-        With python >= 2.6, pySerial uses io.RawIOBase, whose readline only
-        accepts the max number of chars to read. io.RawIOBase does support the
-        idea of a end of line character, but it is an attribute on the instance,
-        which makes sense... except pySerial doesn't pass the newline= keyword
-        argument along to the underlying class, and so you can't actually change
-        it.
-        """
-        done = False
-        line = str()
-        #print 'reading line',
-        while not done:
-            c = self._port.read().decode()
-              # ignore \r since it is part of the line terminator
-            if len(c) == 0:
-                raise SMC100ReadTimeOutException()
-            elif c == '\r':
-                continue
-            elif c == '\n':
-                done = True
-            elif ord(c) > 32 and ord(c) < 127:
-                line += c
-            else:
-                raise SMC100RS232CorruptionException(c)
-
-        self._emit('read', line)
-        return line
-
-    def _emit(self, *args):
-        if len(args) == 1:
-            prefix = ''
-            message = args[0]
-        else:
-            prefix = ' ' + args[0]
-            message = args[1]
-
-        if not self._silent:
-            print('[SMC100' + prefix + '] ' + message)
+    def stop(self):
+        self.sendcmd(command='ST')
 
     def close(self):
         if self._port:
