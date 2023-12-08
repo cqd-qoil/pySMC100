@@ -79,9 +79,8 @@ class SMC100InvalidResponseException(Exception):
 class SMC100Connection:
     _sleepfunc = time.sleep
     def __init__(self, port, silent=True):
-        super(SMC100Connection, self).__init__()
-        assert port is not None
-
+        self._port = None
+        # super(SMC100Connection, self).__init__()
         self._silent = silent
         print('Connecting to SMC100 on {}'.format(port))
         self.COMport = port
@@ -94,12 +93,18 @@ class SMC100Connection:
             xonxoff = True,
             timeout = 0.050)
 
-    def close(self):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
         if self._port:
             self._port.close()
             self._port = None
+
     def __del__(self):
-        self.close()
+        if self._port:
+            self._port.close()
+            self._port = None
 
 class SMC100Stage(SMC100Connection):
     """
@@ -127,6 +132,9 @@ class SMC100Stage(SMC100Connection):
             for k, v in STAGES_DEFAULT_PARAMS[stage_defaults].items():
                 setattr(self, k, v)
 
+    def __getattr__(self,attr):
+        return getattr(self.obj, attr)
+
     def set_defaults(self, name=None):
         if name is None:
             self.name = self.sendcmd(command='ZX',argument='?',expect_response=True)
@@ -137,9 +145,6 @@ class SMC100Stage(SMC100Connection):
                 setattr(self, k, v)
         except Exception as ex:
             raise ex
-
-    def __getattr__(self,attr):
-        return getattr(self.obj, attr)
 
     def sendcmd(self, command, argument=None, expect_response=False, retry=False):
         """
@@ -353,9 +358,8 @@ class SMC100Stage(SMC100Connection):
 
         if not silent:
             print('status:')
-
-        msg = '  state: {}'.format(controller_state_map[state])
-        print(msg)
+            msg = '  state: {}'.format(controller_state_map[state])
+            print(msg)
         return errors, state
 
     def get_position(self):
@@ -421,7 +425,7 @@ class SMC100Stage(SMC100Connection):
         """
 
         assert position < self.travel_range
-        assert position > 0
+        assert not position < 0 # When homing it goes to -0.0, which, apparently, is not 0...
 
         self.sendcmd('PA', position)
 
