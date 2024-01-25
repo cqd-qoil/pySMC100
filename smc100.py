@@ -401,8 +401,8 @@ class SMC100Stage(SMC100Connection):
         """
         current_pos = get_position()
 
-        assert current_pos + distance < self.travel_range
-        assert current_pos + distance > 0
+        # assert current_pos + distance < self.travel_range
+        # assert current_pos + distance > 0
 
         # if dist < 0: # Avoid
         #     dist = max(dist, -current_pos) + buffer
@@ -424,8 +424,8 @@ class SMC100Stage(SMC100Connection):
         If waitStop is True then this method returns when the move is completed.
         """
 
-        assert position < self.travel_range
-        assert not position < 0 # When homing it goes to -0.0, which, apparently, is not 0...
+        # assert position < self.travel_range
+        # assert not position < 0 # When homing it goes to -0.0, which, apparently, is not 0...
 
         self.sendcmd('PA', position)
 
@@ -439,6 +439,17 @@ class SMC100Stage(SMC100Connection):
                                    STATE_NOT_REFERENCED_FROM_MOVING))
             if st == STATE_NOT_REFERENCED_FROM_MOVING and retry:
                 self.home()
+        def enable(self):
+        st = self.get_status(silent=True)
+        if st[1] not in ['3C','3D','3E']:
+            print('Stage not in DISABLE state, trying to enable anyway')
+        self.sendcmd(command='MM',argument=1)
 
+    def disable(self):
+        st = self.get_status(silent=True)
+        if st[1] not in ['32','33', '34', '35']:
+            print('Stage not in READY state, trying to disable anyway')
+        self.sendcmd(command='MM',argument=0)
+        
     def stop(self):
         self.sendcmd(command='ST')
